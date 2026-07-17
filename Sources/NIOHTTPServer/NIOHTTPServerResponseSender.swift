@@ -21,6 +21,7 @@ extension NIOHTTPServer {
     public struct ResponseSender: HTTPResponseSender, ~Copyable {
         let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
         let writerState: WriterState
+        let resetBacking: NIOHTTPServer.ResetBacking
 
         public mutating func sendInformational(_ response: HTTPResponse) async throws {
             precondition(response.status.kind == .informational)
@@ -30,7 +31,20 @@ extension NIOHTTPServer {
         public consuming func send(_ response: HTTPResponse) async throws -> Writer {
             precondition(response.status.kind != .informational)
             try await self.writer.write(.head(response))
-            return Writer(writer: self.writer, writerState: self.writerState)
+            return Writer(writer: self.writer, writerState: self.writerState, resetBacking: self.resetBacking)
+        }
+
+        /// Abandons the response and resets the stream carrying this request.
+        ///
+        /// Call this instead of ``send(_:)`` when the request should be aborted
+        /// before any response head is sent. This consumes the sender, so no
+        /// response can be sent afterwards.
+        ///
+        /// The returned ``NIOHTTPServer/StreamReset`` exposes the coded-reset API
+        /// only on transports that support it; see ``NIOHTTPServer/StreamReset``.
+        public consuming func reset() -> NIOHTTPServer.StreamReset {
+            self.writerState.markReset(self.resetBacking)
+            return self.resetBacking.makeStreamReset()
         }
     }
 }
@@ -43,6 +57,23 @@ extension NIOHTTPServer.ResponseSender {
         }
 
         let wrapped: Mutex<Wrapped> = .init(.init())
+
+        /// Records that the handler chose to reset the stream instead of
+        /// concluding the response normally.
+        ///
+        /// On HTTP/2 the stream is reset with an explicit `RST_STREAM`, which is
+        /// itself a clean conclusion of the exchange, so the response is marked
+        /// as concluded to avoid an erroneous "did not conclude the response"
+        /// teardown. On HTTP/1.1 there is no stream-level reset: leaving the
+        /// response unconcluded is deliberate, so the connection is torn down.
+        func markReset(_ backing: NIOHTTPServer.ResetBacking) {
+            switch backing {
+            case .http2:
+                self.wrapped.withLock { $0.finishedWriting = true }
+            case .http1_1:
+                ()
+            }
+        }
     }
 
     public struct Writer: CallerAsyncWriter, ~Copyable {
@@ -56,6 +87,8 @@ extension NIOHTTPServer.ResponseSender {
         let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
 
         let writerState: WriterState
+
+        let resetBacking: NIOHTTPServer.ResetBacking
 
         public mutating func write(
             buffer: inout some RangeReplaceableContainer<UInt8> & ~Copyable
@@ -106,6 +139,21 @@ extension NIOHTTPServer.ResponseSender {
             }
             try await self.writer.write(.end(finalElement))
             self.writerState.wrapped.withLock { $0.finishedWriting = true }
+        }
+
+        /// Abandons the in-flight response and resets the stream carrying this
+        /// request.
+        ///
+        /// Call this instead of ``finish(buffer:finalElement:)`` when a response
+        /// that has already started (its head is sent) must be aborted — for
+        /// example when a `CONNECT` tunnel's upstream connection fails. This
+        /// consumes the writer, so no further body or trailers can be written.
+        ///
+        /// The returned ``NIOHTTPServer/StreamReset`` exposes the coded-reset API
+        /// only on transports that support it; see ``NIOHTTPServer/StreamReset``.
+        public consuming func reset() -> NIOHTTPServer.StreamReset {
+            self.writerState.markReset(self.resetBacking)
+            return self.resetBacking.makeStreamReset()
         }
     }
 }

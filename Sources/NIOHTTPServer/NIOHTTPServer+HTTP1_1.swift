@@ -231,6 +231,7 @@ extension NIOHTTPServer {
                         request: httpRequest,
                         iterator: iterator,
                         outbound: outbound,
+                        resetBacking: .http1_1,
                         handler: handler,
                         context: context
                     )
@@ -243,7 +244,10 @@ extension NIOHTTPServer {
                 iterator = recoveredIterator
             }
         } catch {
-            self.logger.debug("Error thrown while handling HTTP/1.1 connection", metadata: ["error": "\(error)"])
+            self.logger.debug(
+                "Error thrown while handling HTTP/1.1 connection",
+                metadata: ["error": "\(error)"]
+            )
         }
     }
 }

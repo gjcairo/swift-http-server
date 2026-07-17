@@ -400,6 +400,7 @@ extension NIOHTTPServer {
                         request: httpRequest,
                         iterator: iterator,
                         outbound: outbound,
+                        resetBacking: .http2(channel: channel.channel),
                         handler: handler,
                         context: context
                     )
