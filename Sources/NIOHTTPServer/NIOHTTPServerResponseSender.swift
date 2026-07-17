@@ -22,6 +22,10 @@ extension NIOHTTPServer {
         let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
         let writerState: WriterState
 
+        /// Connection-scoped state (negotiated HTTP version, etc.), used when
+        /// accepting a datagram tunnel to pick the correct accept response.
+        let context: ConnectionContext
+
         public mutating func sendInformational(_ response: HTTPResponse) async throws {
             precondition(response.status.kind == .informational)
             try await self.writer.write(.head(response))

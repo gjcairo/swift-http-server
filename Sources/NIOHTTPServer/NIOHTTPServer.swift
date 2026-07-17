@@ -307,7 +307,7 @@ public struct NIOHTTPServer: HTTPServer {
                 reader: Reader(
                     readerState: readerState
                 ),
-                responseSender: ResponseSender(writer: outbound, writerState: writerState)
+                responseSender: ResponseSender(writer: outbound, writerState: writerState, context: context)
             )
         } catch {
             logger.error("Error thrown while handling request: \(error)")

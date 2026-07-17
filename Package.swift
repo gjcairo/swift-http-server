@@ -90,6 +90,15 @@ let package = Package(
             ],
             swiftSettings: extraSettings
         ),
+        .executableTarget(
+            name: "DatagramTunnelExample",
+            dependencies: [
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                "NIOHTTPServer",
+            ],
+            swiftSettings: extraSettings
+        ),
         .target(
             name: "NIOHTTPServer",
             dependencies: [
