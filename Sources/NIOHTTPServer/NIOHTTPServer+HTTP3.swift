@@ -28,10 +28,7 @@ import X509
 @available(anyAppleOS 26.0, *)
 extension NIOHTTPServer {
     func serveHTTP3<Handler: NIOHTTPServerConnectionHandler>(
-        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-            NIOQUIC.QUICStreamCreator
-        >,
+        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>,
         connectionHandler: Handler
     ) async {
         // We don't use a `withThrowingDiscardingTaskGroup` here because an error thrown from the body or a child task
@@ -50,10 +47,7 @@ extension NIOHTTPServer {
     /// Builds the per-connection ``Connection`` and ``ConnectionContext`` for a HTTP/3 connection channel and
     /// dispatches the connection to the connection handler. Errors from the connection handler are logged.
     func dispatchHTTP3Connection<Handler: NIOHTTPServerConnectionHandler>(
-        _ http3Connection: HTTP3ServerConnection<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-            NIOQUIC.QUICStreamCreator
-        >,
+        _ http3Connection: HTTP3ServerConnection<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>,
         handler: Handler
     ) async {
         let context = ConnectionContext(
@@ -84,10 +78,7 @@ extension NIOHTTPServer {
     ///
     /// - Note: Stream iteration errors are logged but do not propagate to the caller.
     func handleHTTP3Connection<Handler: HTTPServerRequestHandler>(
-        connection: HTTP3ServerConnection<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-            NIOQUIC.QUICStreamCreator
-        >,
+        connection: HTTP3ServerConnection<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>,
         handler: Handler,
         context: ConnectionContext
     ) async
@@ -99,7 +90,12 @@ extension NIOHTTPServer {
         await withDiscardingTaskGroup { streamGroup in
             for await streamChannel in connection.inboundStreams {
                 streamGroup.addTask {
-                    await self.handleStreamChannel(channel: streamChannel, handler: handler, context: context)
+                    await self.handleStreamChannel(
+                        channel: streamChannel.channel,
+                        handler: handler,
+                        context: context,
+                        signalledBy: streamChannel.clientClosed
+                    )
                 }
             }
         }
@@ -114,10 +110,7 @@ extension NIOHTTPServer {
         authenticator: NIOQUIC.Authenticator?
     ) async throws -> [(
         quicChannel: any Channel,
-        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-            NIOQUIC.QUICStreamCreator
-        >
+        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>
     )] {
         let bootstrap = DatagramBootstrap(group: .singletonMultiThreadedEventLoopGroup)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -125,9 +118,7 @@ extension NIOHTTPServer {
         var serverChannels = [
             (
                 any Channel,
-                HTTP3ServerConnectionMultiplexer<
-                    NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>, NIOQUIC.QUICStreamCreator
-                >
+                HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>
             )
         ]()
         do {
@@ -168,14 +159,9 @@ extension NIOHTTPServer {
         authenticator: NIOQUIC.Authenticator?
     ) throws -> (
         quicChannel: any Channel,
-        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>, NIOQUIC.QUICStreamCreator
-        >
+        connectionMultiplexer: HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>
     ) {
-        let connectionMultiplexer = HTTP3ServerConnectionMultiplexer<
-            NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-            NIOQUIC.QUICStreamCreator
-        >()
+        let connectionMultiplexer = HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator>()
 
         let quicHandler = QUICHandler(
             channel: channel,
@@ -218,10 +204,7 @@ extension NIOHTTPServer {
         http3Configuration: NIOHTTPServerConfiguration.HTTP3,
         connectionChannel: any Channel,
         streamCreator: NIOQUIC.QUICStreamCreator,
-    ) throws -> HTTP3ServerConnection<
-        NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-        NIOQUIC.QUICStreamCreator
-    > {
+    ) throws -> HTTP3ServerConnection<HTTPRequestChannelAndCancellationSignal, NIOQUIC.QUICStreamCreator> {
         let loopBoundHandler = NIOLoopBoundBox<HTTP3ConnectionHandler<NIOQUIC.QUICStreamCreator>?>(
             nil,
             eventLoop: connectionChannel.eventLoop
@@ -266,18 +249,32 @@ extension NIOHTTPServer {
     }
 
     /// Configures the pipeline for an inbound HTTP/3 stream channel and wraps it in a `NIOAsyncChannel`.
-    func setupHTTP3Stream(streamChannel: any Channel) throws -> NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart> {
+    func setupHTTP3Stream(streamChannel: any Channel) throws -> HTTPRequestChannelAndCancellationSignal {
         try streamChannel.pipeline.syncOperations.addReadTimeoutHandlers(
             self.configuration.connectionTimeouts,
             expectMultipleRequests: false
         )
 
-        return try NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>(
-            wrappingChannelSynchronously: streamChannel,
-            configuration: .init(
-                backPressureStrategy: .init(self.configuration.backpressureStrategy),
-                isOutboundHalfClosureEnabled: true
-            )
+        // Opt into half-closure semantics for STOP_SENDING, so that frame half-closes our write side and
+        // arrives as a `QUICStopSendingEvent` instead of tearing the stream down.
+        try streamChannel.syncOptions?.setOption(.halfCloseOnStopSending, value: true)
+
+        // Reports this stream going inactive, so an in-flight request handler can be cancelled. The paired
+        // stream is returned below, for the request handling to race against.
+        let (clientClosed, clientClosedContinuation) = AsyncStream<Void>.makeStream()
+        try streamChannel.pipeline.syncOperations.addHandler(
+            ClientClosedMonitor(clientClosed: clientClosedContinuation)
+        )
+
+        return HTTPRequestChannelAndCancellationSignal(
+            channel: try NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>(
+                wrappingChannelSynchronously: streamChannel,
+                configuration: .init(
+                    backPressureStrategy: .init(self.configuration.backpressureStrategy),
+                    isOutboundHalfClosureEnabled: true
+                )
+            ),
+            clientClosed: clientClosed
         )
     }
 }

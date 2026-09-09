@@ -26,7 +26,7 @@ extension NIOHTTPServer {
     /// Abstracts over the types of server channels ``NIOHTTPServer`` can serve.
     enum ServerChannel {
         case plaintextHTTP1_1(
-            channel: NIOAsyncChannel<NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>, Never>,
+            channel: NIOAsyncChannel<HTTPRequestChannelAndCancellationSignal, Never>,
             quiescingHelper: ServerQuiescingHelper
         )
 
@@ -38,10 +38,7 @@ extension NIOHTTPServer {
         #if HTTP3
         case http3(
             quicChannel: any Channel,
-            connectionMultiplexer: HTTP3ServerConnectionMultiplexer<
-                NIOAsyncChannel<HTTPRequestPart, HTTPResponsePart>,
-                QUICStreamCreator
-            >
+            connectionMultiplexer: HTTP3ServerConnectionMultiplexer<HTTPRequestChannelAndCancellationSignal, QUICStreamCreator>
         )
         #endif
     }
