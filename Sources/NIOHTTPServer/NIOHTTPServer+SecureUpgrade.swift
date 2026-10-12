@@ -40,8 +40,8 @@ extension NIOHTTPServer {
 
         let channel: NegotiatedChannel
 
-        /// The context built for the connection when its pipeline was set up, which the connection channel's
-        /// ``ConnectionEventsHandler`` keeps current.
+        /// The context built for the connection when its pipeline was set up, whose
+        /// ``ConnectionContext/connectionEvents`` end when the connection channel closes.
         let context: ConnectionContext
     }
 
@@ -311,14 +311,19 @@ extension NIOHTTPServer {
                 }
             )
         }
-        .flatMapThrowing { multiplexer in
+        .map { multiplexer in
             // This runs once ALPN has negotiated HTTP/2, by which point the handshake has validated any peer
             // certificate chain.
             let context = NIOHTTPServer.makeHTTP2ConnectionContext(
                 connectionChannel: channel,
                 validatedPeerCertificateChain: channel.extractPeerCertificateChain(logger: self.logger)
             )
-            try channel.pipeline.syncOperations.addHandler(ConnectionEventsHandler(connectionContext: context))
+
+            // A TCP connection cannot migrate to a new network path, so no event ever changes this context: all that
+            // is left is to end its events once the connection closes.
+            channel.closeFuture.whenComplete { _ in
+                context.unsubscribeFromConnectionEvents()
+            }
 
             return (channel, multiplexer, context)
         }

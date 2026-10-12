@@ -17,6 +17,9 @@ import NIOCore
 /// This channel handler keeps a connection's ``NIOHTTPServer/ConnectionContext`` current with the events fired into the
 /// connection channel's pipeline, and reports them through the context's
 /// ``NIOHTTPServer/ConnectionContext/connectionEvents``, which it finishes once the connection closes.
+///
+/// Only HTTP/3 connection channels have one: a QUIC connection can migrate to a new network path, whereas a TCP
+/// connection's path is fixed for its lifetime.
 @available(anyAppleOS 27.0, *)
 final class ConnectionEventsHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = NIOAny

@@ -70,8 +70,8 @@ extension NIOHTTPServer {
         /// The sequence finishes once the connection closes. See ``ConnectionEvents``.
         public let connectionEvents: ConnectionEvents
 
-        /// Shared by every copy of this context, so that the connection's ``ConnectionEventsHandler`` keeps them all
-        /// current.
+        /// Shared by every copy of this context, so that over HTTP/3 the connection's ``ConnectionEventsHandler`` keeps
+        /// them all current.
         private let currentRemoteAddress: NIOLockedValueBox<NIOHTTPServer.SocketAddress?>
 
         init(

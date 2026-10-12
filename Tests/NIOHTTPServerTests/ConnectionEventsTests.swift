@@ -136,14 +136,13 @@ struct ConnectionEventsTests {
 
     // MARK: - End to end
 
+    #if HTTP3
+    /// Only HTTP/3 connections can migrate to a new network path, so only their pipelines report connection events.
     @available(anyAppleOS 27.0, *)
-    @Test(
-        "A request handler observes its connection's remote address changing",
-        arguments: NIOHTTPServer.HTTPVersion.allCases
-    )
-    func requestHandlerObservesRemoteAddressChange(httpVersion: NIOHTTPServer.HTTPVersion) async throws {
+    @Test("A request handler observes its connection's remote address changing")
+    func requestHandlerObservesRemoteAddressChange() async throws {
         let (server, clientConfiguration) = try TestHelpers.makeServerAndClientConfiguration(
-            for: httpVersion,
+            for: .http3,
             clientLogger: Self.logger,
             serverLogger: Self.logger
         )
@@ -156,8 +155,9 @@ struct ConnectionEventsTests {
             clientConfiguration: clientConfiguration,
             server: server,
             serverHandler: HTTPServerClosureRequestHandler { _, requestContext, _, responseSender in
-                // Stands in for the QUIC stack reporting a migration on the connection carrying this request.
-                let connectionChannel = Self.connectionChannel(carrying: requestContext)
+                // Stands in for the QUIC stack reporting a migration on the connection carrying this request. The
+                // request's stream channel is a child of that connection's channel.
+                let connectionChannel = requestContext.channel.parent!
                 let event = try await Self.firstEvent(of: requestContext.connectionEvents) {
                     connectionChannel.pipeline.fireUserInboundEventTriggered(
                         NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
@@ -169,13 +169,14 @@ struct ConnectionEventsTests {
                 try await responseSender.sendAndFinish(.init(status: .ok), buffer: &body)
             }
         ) { _, connection in
-            try await Self.sendRequestAndAwaitResponse(on: connection, httpVersion: httpVersion)
+            try await Self.sendRequestAndAwaitResponse(on: connection, httpVersion: .http3)
         }
 
         let (event, remoteAddress) = observed.withLockedValue { $0 }
         #expect(event == .remoteAddressChanged(Self.migratedAddress))
         #expect(remoteAddress == Self.migratedAddress)
     }
+    #endif
 
     @available(anyAppleOS 27.0, *)
     @Test(
@@ -272,20 +273,6 @@ struct ConnectionEventsTests {
         let channel = EmbeddedChannel()
         try channel.pipeline.syncOperations.addHandler(ConnectionEventsHandler(connectionContext: context))
         return channel
-    }
-
-    /// The channel of the connection carrying a request.
-    ///
-    /// Over HTTP/1.1 the request's channel is the connection channel itself, while over HTTP/2 and HTTP/3 it is a
-    /// stream channel whose parent is the connection channel.
-    @available(anyAppleOS 27.0, *)
-    private static func connectionChannel(carrying requestContext: NIOHTTPServer.RequestContext) -> any Channel {
-        switch requestContext.connectionContext.httpVersion {
-        case .plaintextHTTP1_1, .http1_1:
-            requestContext.channel
-        default:
-            requestContext.channel.parent!
-        }
     }
 
     /// Starts iterating `events`, runs `trigger`, and returns the first event that follows, or `nil` if none arrives

@@ -163,7 +163,11 @@ extension NIOHTTPServer {
                 ClientClosedMonitor(clientClosed: clientClosedContinuation)
             )
 
-            try channel.pipeline.syncOperations.addHandler(ConnectionEventsHandler(connectionContext: context))
+            // A TCP connection cannot migrate to a new network path, so no event ever changes this context: all that
+            // is left is to end its events once the connection closes.
+            channel.closeFuture.whenComplete { _ in
+                context.unsubscribeFromConnectionEvents()
+            }
 
             return HTTP1ConnectionChannel(
                 requestChannel: HTTPRequestChannelAndCancellationSignal(

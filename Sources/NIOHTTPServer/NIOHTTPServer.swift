@@ -573,8 +573,8 @@ struct HTTPRequestChannelAndCancellationSignal: Sendable {
 /// An HTTP/1.1 connection, whose channel is also the channel carrying its requests, and the context built for it when
 /// its pipeline was set up.
 ///
-/// The context travels with the channel because the channel's ``ConnectionEventsHandler`` keeps that same context
-/// current.
+/// The context travels with the channel because the channel closing ends that same context's
+/// ``NIOHTTPServer/ConnectionContext/connectionEvents``.
 @available(anyAppleOS 27.0, *)
 struct HTTP1ConnectionChannel: Sendable {
     var requestChannel: HTTPRequestChannelAndCancellationSignal
