@@ -15,8 +15,8 @@
 import NIOCore
 
 /// This channel handler keeps a connection's ``NIOHTTPServer/ConnectionContext`` current with the events fired into the
-/// connection channel's pipeline, and reports them through the context's
-/// ``NIOHTTPServer/ConnectionContext/connectionEvents``, which it finishes once the connection closes.
+/// connection channel's pipeline, and passes them on to the handlers registered with
+/// ``NIOHTTPServer/ConnectionContext/withConnectionEventHandler(operation:onEvent:)``.
 ///
 /// Only HTTP/3 connection channels have one: a QUIC connection can migrate to a new network path, whereas a TCP
 /// connection's path is fixed for its lifetime.
@@ -39,10 +39,5 @@ final class ConnectionEventsHandler: ChannelInboundHandler, RemovableChannelHand
         }
 
         context.fireUserInboundEventTriggered(event)
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        self.connectionContext.unsubscribeFromConnectionEvents()
-        context.fireChannelInactive()
     }
 }

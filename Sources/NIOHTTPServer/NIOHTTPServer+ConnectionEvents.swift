@@ -16,7 +16,8 @@ import Synchronization
 
 @available(anyAppleOS 27.0, *)
 extension NIOHTTPServer {
-    /// Something that happened on a connection, as reported by ``ConnectionEvents``.
+    /// Something that happened on a connection, as reported to the handler passed to
+    /// ``ConnectionContext/withConnectionEventHandler(operation:onEvent:)``.
     @nonexhaustive
     public enum ConnectionEvent: Sendable, Hashable {
         /// The peer's address changed.
@@ -26,135 +27,49 @@ extension NIOHTTPServer {
         /// is the peer's new address, which ``ConnectionContext/remoteAddress`` reports from then on.
         case remoteAddressChanged(NIOHTTPServer.SocketAddress)
     }
-
-    /// The events that happen on a connection.
-    ///
-    /// Any number of tasks can iterate this sequence concurrently: for example, a ``NIOHTTPServerConnectionHandler``
-    /// alongside the request handlers of every request in flight on the connection. Each iterator receives every event
-    /// that happens after it is created, and finishes once the connection closes.
-    ///
-    /// An iterator that falls behind keeps only the most recent events, dropping older ones. The connection's state,
-    /// such as ``ConnectionContext/remoteAddress``, is always current, so read it rather than relying on receiving every
-    /// event.
-    ///
-    /// ```swift
-    /// for await event in requestContext.connectionEvents {
-    ///     switch event {
-    ///     case .remoteAddressChanged(let address):
-    ///         logger.info("Client migrated", metadata: ["address": "\(address)"])
-    ///     default:
-    ///         break
-    ///     }
-    /// }
-    /// ```
-    public struct ConnectionEvents: AsyncSequence, Sendable {
-        let broadcaster: ConnectionEventBroadcaster
-
-        init(broadcaster: ConnectionEventBroadcaster) {
-            self.broadcaster = broadcaster
-        }
-
-        public func makeAsyncIterator() -> AsyncIterator {
-            AsyncIterator(base: self.broadcaster.subscribe().makeAsyncIterator())
-        }
-
-        /// An iterator over a connection's events.
-        public struct AsyncIterator: AsyncIteratorProtocol {
-            private var base: AsyncStream<ConnectionEvent>.Iterator
-
-            init(base: AsyncStream<ConnectionEvent>.Iterator) {
-                self.base = base
-            }
-
-            /// Returns the next event, or `nil` once the connection has closed or the current task is cancelled.
-            public mutating func next(isolation actor: isolated (any Actor)?) async -> ConnectionEvent? {
-                await self.base.next(isolation: actor)
-            }
-
-            /// Returns the next event, or `nil` once the connection has closed or the current task is cancelled.
-            public mutating func next() async -> ConnectionEvent? {
-                await self.base.next(isolation: #isolation)
-            }
-        }
-    }
 }
 
-@available(*, unavailable)
-extension NIOHTTPServer.ConnectionEvents.AsyncIterator: Sendable {}
-
-/// Delivers each of a connection's events to every ``NIOHTTPServer/ConnectionEvents`` iterator that exists when it
-/// happens.
+/// Keeps track of the handlers that want to hear about a connection's events, and calls them when an event happens.
 ///
-/// This is what lets several handlers iterate a connection's events concurrently: the iterators of a single
-/// `AsyncStream` would instead compete for its elements, with each event reaching only one of them.
+/// Handlers are called while holding the lock that registering and removing them also takes. A handler is therefore
+/// never running once it has been removed, at the cost of it not being able to register or remove handlers itself.
 @available(anyAppleOS 27.0, *)
-final class ConnectionEventBroadcaster: Sendable {
-    /// How many undelivered events each iterator buffers before dropping the oldest.
-    static let bufferedEventLimit = 16
+final class ConnectionEventManager: Sendable {
+    private struct Handler {
+        var id: Int
+        var handler: @Sendable (NIOHTTPServer.ConnectionEvent) -> Void
+    }
 
     private struct State {
-        var subscribers: [Int: AsyncStream<NIOHTTPServer.ConnectionEvent>.Continuation] = [:]
-        var nextSubscriberID = 0
-        var isFinished = false
+        var handlers: [Handler] = []
+        var nextHandlerID = 0
     }
 
     private let state = Mutex(State())
 
-    /// The number of iterators currently receiving events.
-    var subscriberCount: Int {
-        self.state.withLock { $0.subscribers.count }
-    }
-
-    /// Returns a stream of the events that happen from now on, which finishes once ``finish()`` is called.
-    func subscribe() -> AsyncStream<NIOHTTPServer.ConnectionEvent> {
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: NIOHTTPServer.ConnectionEvent.self,
-            bufferingPolicy: .bufferingNewest(Self.bufferedEventLimit)
-        )
-
-        let subscriberID: Int? = self.state.withLock { state in
-            guard !state.isFinished else { return nil }
-            let subscriberID = state.nextSubscriberID
-            state.nextSubscriberID += 1
-            state.subscribers[subscriberID] = continuation
-            return subscriberID
-        }
-
-        guard let subscriberID else {
-            // The connection has already closed, so there is nothing left to report.
-            continuation.finish()
-            return stream
-        }
-
-        // Stop delivering to an iterator once it is dropped, or the task iterating it is cancelled.
-        continuation.onTermination = { [weak self] _ in
-            self?.state.withLock { _ = $0.subscribers.removeValue(forKey: subscriberID) }
-        }
-
-        return stream
-    }
-
-    /// Delivers `event` to every subscribed iterator.
-    func yield(_ event: NIOHTTPServer.ConnectionEvent) {
+    /// Registers `handler` to be called with every event from now on, and returns an ID to remove it with.
+    func registerHandler(_ handler: @escaping @Sendable (NIOHTTPServer.ConnectionEvent) -> Void) -> Int {
         self.state.withLock { state in
-            for subscriber in state.subscribers.values {
-                subscriber.yield(event)
-            }
+            let id = state.nextHandlerID
+            state.nextHandlerID += 1
+            state.handlers.append(Handler(id: id, handler: handler))
+            return id
         }
     }
 
-    /// Ends every subscribed iterator, and any that subscribe afterwards.
-    func finish() {
-        let subscribers = self.state.withLock { state in
-            state.isFinished = true
-            let subscribers = state.subscribers
-            state.subscribers = [:]
-            return subscribers
+    /// Removes the handler registered with `id`. It is not called again.
+    func removeHandler(id: Int) {
+        self.state.withLock { state in
+            state.handlers.removeAll { $0.id == id }
         }
+    }
 
-        // Outside the lock: finishing a stream runs its termination handler, which takes the lock.
-        for subscriber in subscribers.values {
-            subscriber.finish()
+    /// Calls every registered handler with `event`, in the order they were registered.
+    func send(_ event: NIOHTTPServer.ConnectionEvent) {
+        self.state.withLock { state in
+            for handler in state.handlers {
+                handler.handler(event)
+            }
         }
     }
 }

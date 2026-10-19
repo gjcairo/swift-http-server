@@ -74,10 +74,14 @@ extension NIOHTTPServer.RequestContext: HTTPServerCapability.PeerCertificate {
 
 @available(anyAppleOS 27.0, *)
 extension NIOHTTPServer.RequestContext: HTTPServerCapability.ConnectionEvents {
-    /// The events that happen on the connection carrying this request, such as the peer's address changing.
+    /// Runs `operation` while `onEvent` is called for each event that happens on the connection carrying this request,
+    /// such as the peer's address changing.
     ///
-    /// The sequence finishes once the connection closes. See ``NIOHTTPServer/ConnectionEvents``.
-    public var connectionEvents: NIOHTTPServer.ConnectionEvents {
-        self.connectionContext.connectionEvents
+    /// See ``NIOHTTPServer/ConnectionContext/withConnectionEventHandler(operation:onEvent:)`` for details.
+    public func withConnectionEventHandler<Return, Failure: Error>(
+        operation: () async throws(Failure) -> Return,
+        onEvent: @escaping @Sendable (NIOHTTPServer.ConnectionEvent) -> Void
+    ) async throws(Failure) -> Return {
+        try await self.connectionContext.withConnectionEventHandler(operation: operation, onEvent: onEvent)
     }
 }

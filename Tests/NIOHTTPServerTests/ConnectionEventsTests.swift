@@ -54,52 +54,129 @@ struct ConnectionEventsTests {
     }
 
     @available(anyAppleOS 27.0, *)
-    @Test("Every iterator receives each event that happens after it was created")
-    func everyIteratorReceivesEachEvent() async throws {
+    @Test("A handler receives the events that happen while its operation runs")
+    func handlerReceivesEventsDuringOperation() async throws {
         let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
         let channel = try Self.makeConnectionChannel(keepingCurrent: context)
-        var first = context.connectionEvents.makeAsyncIterator()
-        var second = context.connectionEvents.makeAsyncIterator()
+        let received = NIOLockedValueBox<[NIOHTTPServer.ConnectionEvent]>([])
 
-        channel.pipeline.fireUserInboundEventTriggered(
-            NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+        await context.withConnectionEventHandler {
+            channel.pipeline.fireUserInboundEventTriggered(
+                NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+            )
+            channel.pipeline.fireUserInboundEventTriggered(
+                NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.secondMigratedAddress)
+            )
+        } onEvent: { event in
+            received.withLockedValue { $0.append(event) }
+        }
+
+        #expect(
+            received.withLockedValue { $0 } == [
+                .remoteAddressChanged(Self.migratedAddress),
+                .remoteAddressChanged(Self.secondMigratedAddress),
+            ]
         )
-        channel.pipeline.fireChannelInactive()
-
-        #expect(await first.next() == .remoteAddressChanged(Self.migratedAddress))
-        #expect(await second.next() == .remoteAddressChanged(Self.migratedAddress))
     }
 
     @available(anyAppleOS 27.0, *)
-    @Test("An iterator does not receive events that happened before it was created")
-    func iteratorSkipsEarlierEvents() async throws {
+    @Test("Every registered handler receives each event")
+    func everyRegisteredHandlerReceivesEachEvent() async throws {
         let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
         let channel = try Self.makeConnectionChannel(keepingCurrent: context)
+        let receivedByOuter = NIOLockedValueBox<[NIOHTTPServer.ConnectionEvent]>([])
+        let receivedByInner = NIOLockedValueBox<[NIOHTTPServer.ConnectionEvent]>([])
+
+        await context.withConnectionEventHandler {
+            await context.withConnectionEventHandler {
+                channel.pipeline.fireUserInboundEventTriggered(
+                    NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+                )
+            } onEvent: { event in
+                receivedByInner.withLockedValue { $0.append(event) }
+            }
+        } onEvent: { event in
+            receivedByOuter.withLockedValue { $0.append(event) }
+        }
+
+        #expect(receivedByOuter.withLockedValue { $0 } == [.remoteAddressChanged(Self.migratedAddress)])
+        #expect(receivedByInner.withLockedValue { $0 } == [.remoteAddressChanged(Self.migratedAddress)])
+    }
+
+    @available(anyAppleOS 27.0, *)
+    @Test("A handler does not receive events from before or after its operation")
+    func handlerIgnoresEventsOutsideItsOperation() async throws {
+        let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
+        let channel = try Self.makeConnectionChannel(keepingCurrent: context)
+        let received = NIOLockedValueBox<[NIOHTTPServer.ConnectionEvent]>([])
 
         channel.pipeline.fireUserInboundEventTriggered(
-            NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+            NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.originalAddress)
         )
-        var iterator = context.connectionEvents.makeAsyncIterator()
+        await context.withConnectionEventHandler {
+            channel.pipeline.fireUserInboundEventTriggered(
+                NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+            )
+        } onEvent: { event in
+            received.withLockedValue { $0.append(event) }
+        }
         channel.pipeline.fireUserInboundEventTriggered(
             NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.secondMigratedAddress)
         )
-        channel.pipeline.fireChannelInactive()
 
-        #expect(await iterator.next() == .remoteAddressChanged(Self.secondMigratedAddress))
+        #expect(received.withLockedValue { $0 } == [.remoteAddressChanged(Self.migratedAddress)])
     }
 
     @available(anyAppleOS 27.0, *)
-    @Test("The connection going inactive ends every iterator, including ones created afterwards")
-    func inactiveConnectionEndsIterators() async throws {
+    @Test("A handler is removed, and the error propagates, when its operation throws")
+    func handlerIsRemovedWhenOperationThrows() async throws {
         let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
         let channel = try Self.makeConnectionChannel(keepingCurrent: context)
-        var before = context.connectionEvents.makeAsyncIterator()
+        let received = NIOLockedValueBox<[NIOHTTPServer.ConnectionEvent]>([])
 
-        channel.pipeline.fireChannelInactive()
-        var after = context.connectionEvents.makeAsyncIterator()
+        await #expect(throws: TestError.intentional) {
+            try await context.withConnectionEventHandler {
+                throw TestError.intentional
+            } onEvent: { event in
+                received.withLockedValue { $0.append(event) }
+            }
+        }
+        channel.pipeline.fireUserInboundEventTriggered(
+            NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+        )
 
-        #expect(await before.next() == nil)
-        #expect(await after.next() == nil)
+        #expect(received.withLockedValue { $0 }.isEmpty)
+    }
+
+    @available(anyAppleOS 27.0, *)
+    @Test("The operation's result is returned")
+    func operationResultIsReturned() async throws {
+        let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
+
+        let result = await context.withConnectionEventHandler {
+            "result"
+        } onEvent: { _ in
+        }
+
+        #expect(result == "result")
+    }
+
+    @available(anyAppleOS 27.0, *)
+    @Test("The remote address is already updated when a handler is called")
+    func remoteAddressIsUpdatedBeforeHandlersAreCalled() async throws {
+        let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
+        let channel = try Self.makeConnectionChannel(keepingCurrent: context)
+        let addressSeenByHandler = NIOLockedValueBox<NIOHTTPServer.SocketAddress?>(nil)
+
+        await context.withConnectionEventHandler {
+            channel.pipeline.fireUserInboundEventTriggered(
+                NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
+            )
+        } onEvent: { _ in
+            addressSeenByHandler.withLockedValue { $0 = context.remoteAddress }
+        }
+
+        #expect(addressSeenByHandler.withLockedValue { $0 } == Self.migratedAddress)
     }
 
     @available(anyAppleOS 27.0, *)
@@ -118,20 +195,6 @@ struct ConnectionEventsTests {
         #expect(recorder.events.count == 2)
         #expect(recorder.events.first as? NIOHTTPServer.ConnectionEvent == .remoteAddressChanged(Self.migratedAddress))
         #expect(recorder.events.last as? ChannelEvent == .inputClosed)
-    }
-
-    @available(anyAppleOS 27.0, *)
-    @Test("A dropped iterator is no longer delivered to")
-    func droppedIteratorIsUnregistered() throws {
-        let context = NIOHTTPServer.ConnectionContext(httpVersion: .http2, remoteAddress: Self.originalAddress)
-
-        do {
-            let iterator = context.connectionEvents.makeAsyncIterator()
-            #expect(context.connectionEvents.broadcaster.subscriberCount == 1)
-            _ = consume iterator
-        }
-
-        #expect(context.connectionEvents.broadcaster.subscriberCount == 0)
     }
 
     // MARK: - End to end
@@ -154,16 +217,27 @@ struct ConnectionEventsTests {
         try await TestHelpers.withClientServerConnection(
             clientConfiguration: clientConfiguration,
             server: server,
-            serverHandler: HTTPServerClosureRequestHandler { _, requestContext, _, responseSender in
+            serverHandler: HTTPServerClosureRequestHandler { _, requestContext, reader, responseSender in
+                var reader = reader
+
                 // Stands in for the QUIC stack reporting a migration on the connection carrying this request. The
                 // request's stream channel is a child of that connection's channel.
                 let connectionChannel = requestContext.channel.parent!
-                let event = try await Self.firstEvent(of: requestContext.connectionEvents) {
+                let (events, eventsContinuation) = AsyncStream.makeStream(of: NIOHTTPServer.ConnectionEvent.self)
+
+                // Only the long-running part of the handler goes inside the operation: it is a closure, so it can use
+                // the noncopyable `reader` but cannot consume the `responseSender` that it captures.
+                try await requestContext.withConnectionEventHandler {
                     connectionChannel.pipeline.fireUserInboundEventTriggered(
                         NIOHTTPServer.ConnectionEvent.remoteAddressChanged(Self.migratedAddress)
                     )
+                    let event = await Self.firstEvent(of: events)
+                    observed.withLockedValue { $0 = (event, requestContext.remoteAddress) }
+
+                    try await reader.read { _, _ in }
+                } onEvent: { event in
+                    eventsContinuation.yield(event)
                 }
-                observed.withLockedValue { $0 = (event, requestContext.remoteAddress) }
 
                 var body = UniqueArray<UInt8>(copying: [])
                 try await responseSender.sendAndFinish(.init(status: .ok), buffer: &body)
@@ -177,55 +251,6 @@ struct ConnectionEventsTests {
         #expect(remoteAddress == Self.migratedAddress)
     }
     #endif
-
-    @available(anyAppleOS 27.0, *)
-    @Test(
-        "A connection's events finish when the client closes the connection",
-        arguments: NIOHTTPServer.HTTPVersion.allCases
-    )
-    func connectionEventsFinishWhenClientCloses(httpVersion: NIOHTTPServer.HTTPVersion) async throws {
-        let (server, clientConfiguration) = try TestHelpers.makeServerAndClientConfiguration(
-            for: httpVersion,
-            clientLogger: Self.logger,
-            serverLogger: Self.logger
-        )
-
-        let (subscribed, subscribedContinuation) = AsyncStream.makeStream(of: Void.self)
-        let (finished, finishedContinuation) = AsyncStream.makeStream(of: Void.self)
-
-        try await TestHelpers.withClientServerConnection(
-            clientConfiguration: clientConfiguration,
-            server: server,
-            connectionHandler: NIOHTTPServerClosureConnectionHandler { connection, context in
-                // Unstructured, so that observing the events cannot hold the connection open.
-                Task {
-                    var iterator = context.connectionEvents.makeAsyncIterator()
-                    subscribedContinuation.finish()
-                    while await iterator.next() != nil {}
-                    finishedContinuation.finish()
-                }
-
-                await connection.handleRequests { _, _, _, _ in }
-            }
-        ) { _, connection in
-            for await _ in subscribed {}
-
-            #if HTTP3
-            if httpVersion == .http3 {
-                try await connection.closeAnnouncingDeparture()
-            } else {
-                try await connection.close()
-            }
-            #else
-            try await connection.close()
-            #endif
-
-            #expect(
-                await Self.finishes(finished, within: Self.deliveryWindow),
-                "The connection's events should have finished once the client closed the connection (\(httpVersion))."
-            )
-        }
-    }
 
     @available(anyAppleOS 27.0, *)
     @Test(
@@ -275,19 +300,15 @@ struct ConnectionEventsTests {
         return channel
     }
 
-    /// Starts iterating `events`, runs `trigger`, and returns the first event that follows, or `nil` if none arrives
-    /// within ``deliveryWindow``.
+    #if HTTP3
+    /// Returns the first event `events` yields, or `nil` if none arrives within ``deliveryWindow``.
     @available(anyAppleOS 27.0, *)
     private static func firstEvent(
-        of events: NIOHTTPServer.ConnectionEvents,
-        after trigger: () async throws -> Void
-    ) async throws -> NIOHTTPServer.ConnectionEvent? {
-        let (subscribed, subscribedContinuation) = AsyncStream.makeStream(of: Void.self)
-
-        return try await withThrowingTaskGroup(of: NIOHTTPServer.ConnectionEvent?.self) { group in
+        of events: AsyncStream<NIOHTTPServer.ConnectionEvent>
+    ) async -> NIOHTTPServer.ConnectionEvent? {
+        await withTaskGroup(of: NIOHTTPServer.ConnectionEvent?.self) { group in
             group.addTask {
                 var iterator = events.makeAsyncIterator()
-                subscribedContinuation.finish()
                 return await iterator.next()
             }
             group.addTask {
@@ -295,32 +316,12 @@ struct ConnectionEventsTests {
                 return nil
             }
 
-            for await _ in subscribed {}
-            try await trigger()
-
-            let first = try await group.next() ?? nil
+            let first = await group.next() ?? nil
             group.cancelAll()
             return first
         }
     }
-
-    /// Returns whether `stream` finishes within `window`.
-    private static func finishes(_ stream: AsyncStream<Void>, within window: Duration) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                for await _ in stream {}
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(for: window)
-                return false
-            }
-
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
-        }
-    }
+    #endif
 
     /// Sends a bodiless `GET` on a new request channel and reads the response through to its end.
     @available(anyAppleOS 27.0, *)

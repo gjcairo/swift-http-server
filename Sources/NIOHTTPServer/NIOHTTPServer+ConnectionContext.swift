@@ -52,7 +52,7 @@ extension NIOHTTPServer {
         /// The peer's address, when known.
         ///
         /// Over HTTP/3 this can change during the connection's lifetime, when the client migrates the connection to a
-        /// new network path. ``connectionEvents`` reports each change.
+        /// new network path. ``withConnectionEventHandler(operation:onEvent:)`` reports each change.
         public var remoteAddress: NIOHTTPServer.SocketAddress? {
             self.currentRemoteAddress.withLockedValue { $0 }
         }
@@ -65,14 +65,11 @@ extension NIOHTTPServer {
         /// derived validated chain.
         public var validatedPeerCertificateChain: X509.ValidatedCertificateChain?
 
-        /// The events that happen on this connection, such as the peer's address changing.
-        ///
-        /// The sequence finishes once the connection closes. See ``ConnectionEvents``.
-        public let connectionEvents: ConnectionEvents
-
         /// Shared by every copy of this context, so that over HTTP/3 the connection's ``ConnectionEventsHandler`` keeps
         /// them all current.
         private let currentRemoteAddress: NIOLockedValueBox<NIOHTTPServer.SocketAddress?>
+
+        private let eventManager: ConnectionEventManager
 
         init(
             httpVersion: HTTPVersion,
@@ -84,23 +81,62 @@ extension NIOHTTPServer {
             self.currentRemoteAddress = NIOLockedValueBox(remoteAddress)
             self.localAddress = localAddress
             self.validatedPeerCertificateChain = validatedPeerCertificateChain
-            self.connectionEvents = ConnectionEvents(broadcaster: ConnectionEventBroadcaster())
+            self.eventManager = ConnectionEventManager()
         }
 
-        /// Applies an `event` received on the connection to this context, then delivers it to every iterator of
-        /// ``connectionEvents``.
+        /// Runs `operation` while `onEvent` is called for each event that happens on the connection.
+        ///
+        /// Use this to react to changes in the connection beneath a request, such as the peer's address changing when a
+        /// client migrates an HTTP/3 connection to a new network path:
+        ///
+        /// ```swift
+        /// try await requestContext.withConnectionEventHandler {
+        ///     try await proxyToUpstream()
+        /// } onEvent: { event in
+        ///     switch event {
+        ///     case .remoteAddressChanged(let address):
+        ///         logger.info("Client migrated", metadata: ["address": "\(address)"])
+        ///     default:
+        ///         break
+        ///     }
+        /// }
+        /// ```
+        ///
+        /// `onEvent` is registered before `operation` starts and removed once it finishes, whether it returns or throws,
+        /// so it only hears about events that happen while `operation` is running. Events are not buffered. To be sure
+        /// not to miss a change, read the current state (for example ``remoteAddress``) from inside `operation`.
+        ///
+        /// `operation` is a closure, so the noncopyable values it captures, such as the reader and response sender a
+        /// request handler receives, can be used inside it but not consumed by it. Wrap only the long-running part of
+        /// the handler, and consume the response sender once this method has returned.
+        ///
+        /// `onEvent` is called synchronously on the connection's event loop, concurrently with `operation`, once for
+        /// each event in the order the events happen. It must return quickly and not block: to handle events
+        /// asynchronously, yield them into an `AsyncStream`'s continuation. State such as ``remoteAddress`` is already
+        /// up to date by the time `onEvent` is called. `onEvent` is never running once this method has returned.
+        ///
+        /// - Parameters:
+        ///   - operation: The work to run, typically the rest of the request handler.
+        ///   - onEvent: Called with each event that happens on the connection while `operation` is running.
+        /// - Returns: The value returned by `operation`.
+        public func withConnectionEventHandler<Return, Failure: Error>(
+            operation: () async throws(Failure) -> Return,
+            onEvent: @escaping @Sendable (ConnectionEvent) -> Void
+        ) async throws(Failure) -> Return {
+            let handlerID = self.eventManager.registerHandler(onEvent)
+            defer { self.eventManager.removeHandler(id: handlerID) }
+
+            return try await operation()
+        }
+
+        /// Applies an `event` received on the connection to this context, then passes it to the registered handlers.
         func connectionEventReceived(_ event: ConnectionEvent) {
             switch event {
             case .remoteAddressChanged(let address):
                 self.currentRemoteAddress.withLockedValue { $0 = address }
             }
 
-            self.connectionEvents.broadcaster.yield(event)
-        }
-
-        /// Ends every iterator of ``connectionEvents``, now that the connection has closed.
-        func unsubscribeFromConnectionEvents() {
-            self.connectionEvents.broadcaster.finish()
+            self.eventManager.send(event)
         }
     }
 }
