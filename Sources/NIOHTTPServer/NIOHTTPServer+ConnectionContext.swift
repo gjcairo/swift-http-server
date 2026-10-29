@@ -92,7 +92,7 @@ extension NIOHTTPServer {
         ///
         /// ```swift
         /// try await requestContext.withConnectionEventHandler {
-        ///     try await proxyToUpstream()
+        ///     try await handleRequest()
         /// } onEvent: { event in
         ///     switch event {
         ///     case .remoteAddressChanged(let address):
@@ -104,12 +104,7 @@ extension NIOHTTPServer {
         /// ```
         ///
         /// `onEvent` is registered before `operation` starts and removed once it finishes, whether it returns or throws,
-        /// so it only hears about events that happen while `operation` is running. Events are not buffered. To be sure
-        /// not to miss a change, read the current state (for example ``remoteAddress``) from inside `operation`.
-        ///
-        /// `operation` is a closure, so the noncopyable values it captures, such as the reader and response sender a
-        /// request handler receives, can be used inside it but not consumed by it. Wrap only the long-running part of
-        /// the handler, and consume the response sender once this method has returned.
+        /// so it only hears about events that happen while `operation` is running. Events are not buffered.
         ///
         /// `onEvent` is called synchronously on the connection's event loop, concurrently with `operation`, once for
         /// each event in the order the events happen. It must return quickly and not block: to handle events
