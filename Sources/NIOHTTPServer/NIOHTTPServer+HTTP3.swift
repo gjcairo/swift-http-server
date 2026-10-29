@@ -273,6 +273,13 @@ extension NIOHTTPServer {
         do {
             (quicChannel, inboundConnections) = try await bootstrap.bind(to: address) { channel in
                 channel.eventLoop.makeCompletedFuture {
+                    // Set don't fragment on IP sockets for QUIC per RFC 9000, § 14.
+                    switch address {
+                    case .v4, .v6:
+                        try QUICDontFragment.set(on: channel)
+                    case .unixDomainSocket:
+                        break
+                    }
                     let inboundConnections = try self.setupQUICChannel(
                         channel: channel,
                         configuration: configuration,
